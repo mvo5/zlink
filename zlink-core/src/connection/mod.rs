@@ -124,6 +124,41 @@ where
         self.receive_reply().await
     }
 
+    /// Call a method by name with dynamic (untyped) parameters and reply.
+    ///
+    /// This is a convenience wrapper around [`Connection::call_method`] for use cases where the
+    /// method name and parameters are not known at compile time — e.g. HTTP bridges, CLI tools,
+    /// proxies, or anything that discovers available methods via `GetInfo` at runtime.
+    ///
+    /// Standard `org.varlink.service.*` errors are still caught and returned as
+    /// [`crate::Error::VarlinkService`]. Application-specific errors are returned as
+    /// `Err(serde_json::Value)` in the inner [`reply::Result`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> zlink_core::Result<()> {
+    /// # let mut conn: zlink_core::Connection<zlink_core::connection::socket::impl_for_doc::Socket> = todo!();
+    /// let reply = conn
+    ///     .call_dynamic("org.example.GetUser", serde_json::json!({"id": 42}))
+    ///     .await?;
+    /// match reply {
+    ///     Ok(reply) => println!("reply: {:?}", reply.parameters()),
+    ///     Err(error) => println!("application error: {error}"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn call_dynamic(
+        &mut self,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<reply::Result<serde_json::Value, serde_json::Value>> {
+        let call = Call::new(DynamicMethod { method, parameters });
+        self.send_call(&call).await?;
+        self.receive_reply().await
+    }
+
     /// Receive a method call over the socket.
     ///
     /// Convenience wrapper around [`ReadConnection::receive_call`].
@@ -312,7 +347,95 @@ where
     }
 }
 
+/// Internal method type for [`Connection::call_dynamic`].
+///
+/// Serializes as `{"method": "<name>", "parameters": <value>}` which is what the [`Call`]
+/// serializer expects to flatten into the wire message.
+#[derive(Debug, Serialize)]
+struct DynamicMethod<'m> {
+    method: &'m str,
+    parameters: serde_json::Value,
+}
+
 pub(crate) const BUFFER_SIZE: usize = 256;
 const MAX_BUFFER_SIZE: usize = 100 * 1024 * 1024; // Don't allow buffers over 100MB.
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::mock_socket::MockSocket;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn call_dynamic_success() -> crate::Result<()> {
+        let socket = MockSocket::new(&[r#"{"parameters":{"name":"alice","id":42}}"#]);
+        let mut conn = Connection::new(socket);
+
+        let reply = conn
+            .call_dynamic("org.example.GetUser", json!({"id": 42}))
+            .await?;
+
+        let params = reply.unwrap().into_parameters().unwrap();
+        assert_eq!(params["name"], "alice");
+        assert_eq!(params["id"], 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn call_dynamic_empty_parameters() -> crate::Result<()> {
+        let socket = MockSocket::new(&[r#"{"parameters":{}}"#]);
+        let mut conn = Connection::new(socket);
+
+        let reply = conn.call_dynamic("org.example.Ping", json!({})).await?;
+
+        let params = reply.unwrap().into_parameters().unwrap();
+        assert_eq!(params, json!({}));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn call_dynamic_no_parameters_in_reply() -> crate::Result<()> {
+        let socket = MockSocket::new(&[r#"{}"#]);
+        let mut conn = Connection::new(socket);
+
+        let reply = conn.call_dynamic("org.example.Ping", json!({})).await?;
+
+        assert!(reply.unwrap().into_parameters().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn call_dynamic_application_error() -> crate::Result<()> {
+        let socket =
+            MockSocket::new(&[r#"{"error":"org.example.UserNotFound","parameters":{"id":99}}"#]);
+        let mut conn = Connection::new(socket);
+
+        let reply = conn
+            .call_dynamic("org.example.GetUser", json!({"id": 99}))
+            .await?;
+
+        let err = reply.unwrap_err();
+        assert_eq!(err["error"], "org.example.UserNotFound");
+        assert_eq!(err["parameters"]["id"], 99);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn call_dynamic_varlink_service_error() {
+        let socket = MockSocket::new(&[
+            r#"{"error":"org.varlink.service.MethodNotFound","parameters":{"method":"org.example.Missing"}}"#,
+        ]);
+        let mut conn = Connection::new(socket);
+
+        let result = conn.call_dynamic("org.example.Missing", json!({})).await;
+
+        // org.varlink.service.* errors are returned as the top-level zlink::Error.
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::VarlinkService(_)),
+            "expected VarlinkService error, got: {err:?}"
+        );
+    }
+}
